@@ -1,0 +1,94 @@
+pipeline {
+    agent any
+    
+    environment {
+        AWS_ACCOUNT_ID = credentials('AWS_ACCOUNT_ID')
+        AWS_DEFAULT_REGION = 'us-west-2'
+        IMAGE_REPO_NAME = 'your-ecr-repo-name'
+        IMAGE_TAG = "${env.BUILD_NUMBER}"
+        REPOSITORY_URI = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${IMAGE_REPO_NAME}"
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+    
+        stage('Build and Test') {
+            steps {
+                sh '''
+                    python3 -m venv venv
+                    . venv/bin/activate
+                    pip install -r requirements.txt
+                    pytest src/tests --junitxml=test-results/results.xml
+                '''
+            }
+            post {
+                always {
+                    junit 'test-results/*.xml'
+                }
+            }
+        }
+        
+        stage('Static Code Analysis') {
+            parallel {
+                stage('Linting') {
+                    steps {
+                        sh '. venv/bin/activate && pylint src/app --exit-zero'
+                    }
+                }
+                stage('Security Scan') {
+                    steps {
+                        sh '. venv/bin/activate && bandit -r src/app -f custom'
+                    }
+                }
+            }
+        }
+        
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    docker.build("${IMAGE_REPO_NAME}:${IMAGE_TAG}")
+                }
+            }
+        }
+    
+        stage('Push to ECR') {
+            steps {
+                script {
+                    sh "aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${REPOSITORY_URI}"
+                    sh "docker tag ${IMAGE_REPO_NAME}:${IMAGE_TAG} ${REPOSITORY_URI}:${IMAGE_TAG}"
+                    sh "docker push ${REPOSITORY_URI}:${IMAGE_TAG}"
+                }
+            }
+        }
+        
+        stage('Deploy to ECS') {
+            steps {
+                script {
+                    sh '''
+                        TASK_DEFINITION=$(aws ecs describe-task-definition --task-definition your-task-definition-name --region ${AWS_DEFAULT_REGION})
+                        NEW_TASK_DEFINITION=$(echo $TASK_DEFINITION | jq --arg IMAGE "${REPOSITORY_URI}:${IMAGE_TAG}" '.taskDefinition | .containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities)')
+                        NEW_TASK_INFO=$(aws ecs register-task-definition --region ${AWS_DEFAULT_REGION} --cli-input-json "$NEW_TASK_DEFINITION")
+                        NEW_REVISION=$(echo $NEW_TASK_INFO | jq '.taskDefinition.revision')
+                        aws ecs update-service --cluster your-cluster-name --service your-service-name --task-definition your-task-definition-name:${NEW_REVISION} --region ${AWS_DEFAULT_REGION}
+                    '''
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            slackSend(color: 'good', message: "Pipeline succeeded! New version deployed: ${env.BUILD_NUMBER}")
+        }
+        failure {
+            slackSend(color: 'danger', message: "Pipeline failed! Check build: ${env.BUILD_URL}")
+        }
+    }
+}
